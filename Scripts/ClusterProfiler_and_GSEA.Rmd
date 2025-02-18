@@ -1,0 +1,1333 @@
+---
+title: "ClusterProfiler and GSEA Analysis: OCI-AML3-NPM1c-degron TTLL4kd dTAG"
+output:
+  html_document:
+    toc: true
+  pdf_document:
+    toc: true
+    df_print: paged
+author: "David Shechter"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+params:
+  input_filename: "C:/Users/david/OneDrive/Bioinformatics/NPM1-TTLL4/shRNA-RNAseq/comparisons.txt"
+  genes_to_highlight: "C:/Users/david/OneDrive/Bioinformatics/NPM1-TTLL4/shRNA-RNAseq/genes_to_highlight.txt"
+  max_genes_to_highlight: 20 # max number to show on volcano or correplation plot
+  number_of_genes_to_plot: 500 # max number to show on TPM correlation
+  num_clusters: 4 # for TPM k-means clustering
+  max_ontologies: 8
+  use_saved_rds: FALSE  # Set TRUE to use saved RDS files if available, able to replot data if ontology analysis already run
+  pvalue_threshold: 0.01  # Example use: --pvalue_threshold 0.01
+  qvalue_threshold: 0.05 # for ontology etc
+  log2FC_threshold: 0.58 
+  upreg_color: "#A75C83" #purple, matches Alex's figure #"#B2182B" # red
+  downreg_color: "#135A56" # blue-green, matches Alex's figure  #"2166AC" #blue
+  genome: "hg38"  # Example use: --genome "mm10"
+  species: "Homo sapiens"
+  output_dir: "C:/Users/david/OneDrive/Bioinformatics/NPM1-TTLL4/shRNA-RNAseq/Output/"
+---
+# Overview
+
+This script conducts **enrichment analyses** using `ClusterProfiler` and **Gene Set Enrichment Analysis (GSEA)**. It is designed for **RNA-seq** data.
+
+### **Key Features**
+- Converts Ensembl gene IDs to **ENTREZ IDs** using Ensembl BioMart.
+- Executes **Gene Ontology (GO)** and **KEGG pathway** enrichment using `ClusterProfiler`.
+- Dynamically retrieves **gene sets** from MSigDB for GSEA.
+- Plots results including **dot plots**, **ridge plots**, and **enrichment heatmaps**.
+
+---
+
+# **Data Preparation**
+
+1. **Input Data Loading**:
+   - Reads a table containing file paths and dataset names.
+   - Supports CSV and TSV input formats.
+   - Cleans and standardizes gene identifiers.
+
+2. **Gene ID Conversion**:
+   - Maps Ensembl gene IDs to ENTREZ IDs using species-specific datasets from BioMart.
+   - Supported species: *Homo sapiens* (hg38), *Mus musculus* (mm10).
+
+---
+
+# **ClusterProfiler Analysis**
+
+- Conducts **GO enrichment** across three ontologies: 
+  - **Biological Process (BP)**
+  - **Cellular Component (CC)**
+  - **Molecular Function (MF)**
+  
+- Runs **KEGG pathway enrichment**, identifying significantly enriched pathways.
+- Outputs enrichment results in CSV format and generates visualizations.
+
+---
+
+# **Gene Set Enrichment Analysis (GSEA)**
+
+1. **Dynamic Gene Set Loading**:
+   - Retrieves **gene sets** from MSigDB categories such as:
+     - C2: KEGG, CP (canonical pathways), CGP (chemical and genetic perturbations)
+     - C3: Regulatory target sets
+     - C6: Oncogenic signatures
+     - Reactome pathways
+  
+2. **Gene Ranking**:
+   - Ranks genes based on **log2 fold change**.
+   - Adds noise to handle tied ranks and filters for valid ENTREZ IDs.
+
+3. **Enrichment Analysis**:
+   - Uses `fgsea` to calculate pathway enrichment scores.
+   - Filters results by significance thresholds (e.g., p-value < 0.05).
+
+4. **Result Visualization**:
+   - Generates and saves:
+     - **Dot plots** for enriched pathways.
+     - **Ridge plots** summarizing pathway enrichment.
+     - **NES heatmaps** comparing normalized enrichment scores across datasets.
+
+---
+
+# **Output**
+
+- Results are saved in multiple subdirectories:
+  - `/tables/`: Contains CSV files for enrichment results.
+  - `/plots/`: Stores all plot outputs.
+  - `/ClusterProfiler/`: Saves GO and KEGG results.
+  - `/GSEA/`: Stores GSEA output files and plots.
+
+
+#Setup
+*Load libraries and create output directories*
+
+```{r setup, include=FALSE, echo=FALSE, warning=FALSE,message=FALSE }
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+library(DESeq2)
+library(ggplot2)
+library(dplyr)
+library(ggrepel)
+library(GeneOverlap)
+library(clusterProfiler)
+library(readr)
+library(org.Hs.eg.db)
+library(org.Mm.eg.db)
+library(enrichplot)
+library(DOSE)
+library(enrichplot)
+library(msigdbr)
+library(patchwork)
+library(stats)
+library(biomaRt)
+library(pheatmap)
+library(ComplexHeatmap)
+library(ggvenn)
+library(RColorBrewer)
+library(viridis)
+#library(pathview)
+library(KEGGREST)
+#library(AnnotationHub)
+
+# Create necessary subdirectories
+dir.create(params$output_dir, showWarnings = FALSE)
+dir.create(file.path(params$output_dir, "tables/"), showWarnings = FALSE)
+dir.create(file.path(params$output_dir, "plots/"), showWarnings = FALSE)
+dir.create(file.path(params$output_dir, "geneOverlap/"), showWarnings = FALSE)
+dir.create(file.path(params$output_dir, "ClusterProfiler/"), showWarnings = FALSE)
+dir.create(file.path(params$output_dir, "GSEA/"), showWarnings = FALSE)
+
+table_output_dir <- paste0(params$output_dir, "tables/")
+plot_output_dir <- paste0(params$output_dir, "plots/")
+geneOverlap_output_dir <- paste0(params$output_dir, "geneOverlap/")
+clusterProfiler_output_dir <- paste0(params$output_dir, "ClusterProfiler/")
+GSEA_output_dir <- paste0(params$output_dir, "GSEA/")
+
+```
+
+*Load and prepare data*
+
+#Load and prepare data
+```{r load files and prepare data, warning=FALSE, echo=FALSE}
+
+
+stopifnot(file.exists(params$input_filename))
+
+# Read input data paths
+input_data <- read_csv(params$input_filename, col_names = TRUE, show_col_types = FALSE)
+
+if (!all(colnames(input_data) %in% c("sample", "name"))) {
+  colnames(input_data) <- c("sample", "name")
+}
+
+# Validate and read data files
+stopifnot(all(file.exists(input_data$sample)))
+
+read_data <- function(file_path) {
+  if (grepl("\\.csv$", file_path)) {
+    read_csv(file_path, show_col_types = FALSE)
+  } else if (grepl("\\.tsv$", file_path)) {
+    read_tsv(file_path)
+  } else {
+    stop("Unsupported file format. Use .csv or .tsv.")
+  }
+}
+
+data_list <- lapply(input_data$sample, read_data)
+names(data_list) <- input_data$name
+
+# Clean gene IDs
+clean_gene_id <- function(df) {
+  df$gene_id <- gsub("\\..*", "", df$gene_id)
+  return(df)
+}
+
+data_list <- lapply(data_list, clean_gene_id)
+
+#outputdir
+output_dir <- params$output_dir 
+
+
+```
+
+#Convert IDs Biomart / Entrez
+```{r convert ids}
+
+
+convert_and_map_entrez <- function(df, species = "Homo sapiens") {
+  message("Attempting to retrieve Entrez IDs...")
+
+  # Ensure gene_id column exists
+  if (!"gene_id" %in% colnames(df)) {
+    stop("Error: `gene_id` column is missing from input data.")
+  }
+
+  df$entrezgene_id <- NA  # Initialize column to avoid missing joins
+
+  # Try OrgDb first (FAST and OFFLINE)
+  message("Trying OrgDb...")
+  OrgDb <- if (species == "Homo sapiens") org.Hs.eg.db else if (species == "Mus musculus") org.Mm.eg.db else NULL
+
+  if (!is.null(OrgDb)) {
+    mapped_genes <- tryCatch({
+      select(OrgDb, keys = df$gene_id, keytype = "ENSEMBL", columns = "ENTREZID")
+    }, error = function(e) NULL)
+
+    if (!is.null(mapped_genes) && nrow(mapped_genes) > 0) {
+      message(paste("OrgDb: Retrieved", nrow(mapped_genes), "Entrez IDs"))
+      df <- merge(df, mapped_genes, by.x = "gene_id", by.y = "ENSEMBL", all.x = TRUE)
+      return(df)
+    }
+  }
+
+  # If OrgDb fails, try BioMart (SLOWER, ONLINE)
+  message("OrgDb failed. Trying BioMart...")
+  mart_dataset <- ifelse(species == "Homo sapiens", "hsapiens_gene_ensembl",
+                         ifelse(species == "Mus musculus", "mmusculus_gene_ensembl", NULL))
+
+  if (!is.null(mart_dataset)) {
+    mart <- tryCatch({
+      useMart("ensembl", dataset = mart_dataset, host = "https://www.ensembl.org")
+    }, error = function(e) NULL)
+
+    if (!is.null(mart)) {
+      mapped_genes <- getBM(
+        attributes = c("ensembl_gene_id", "entrezgene_id"),
+        filters = "ensembl_gene_id",
+        values = unique(na.omit(df$gene_id)),
+        mart = mart
+      )
+
+      if (nrow(mapped_genes) > 0) {
+        message(paste("BioMart: Retrieved", nrow(mapped_genes), "Entrez IDs"))
+        df <- merge(df, mapped_genes, by.x = "gene_id", by.y = "ensembl_gene_id", all.x = TRUE)
+        return(df)
+      }
+    }
+  }
+
+  # If both OrgDb and BioMart fail, try MSigDB (LIMITED COVERAGE)
+  message("BioMart failed. Trying MSigDB...")
+  msigdb_genes <- msigdbr(species = species) %>%
+    dplyr::select(gs_name, entrez_gene)
+
+  df <- df %>% dplyr::left_join(msigdb_genes, by = c("gene_id" = "gs_name"))
+
+  # Check if MSigDB found any matches
+  valid_entrez_count <- sum(!is.na(df$entrez_gene))
+  if (valid_entrez_count > 0) {
+    message(paste("MSigDB: Retrieved", valid_entrez_count, "Entrez IDs"))
+    df <- df %>% dplyr::rename(entrezgene_id = entrez_gene)
+    return(df)
+  }
+
+  # If everything fails
+  stop("Error: No valid Entrez IDs found from OrgDb, BioMart, or MSigDB. Gene conversion failed.")
+}
+
+
+# Apply ID mapping to all datasets in the list
+data_list <- lapply(data_list, function(df) convert_and_map_entrez(df, species = params$species))
+
+
+
+```
+#Plot functions for clusterProfiler results
+
+```{r plot functions}
+# Generates dot, bar, and biological theme plots (emapplot)
+# Function to generate dot plot
+generate_dot_plot <- function(result, title, output_dir, filename_prefix, max_ontologies = params$max_ontologies) {
+  dot_plot <- dotplot(result, showCategory = max_ontologies) +
+    ggtitle(title) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      axis.text.y = element_text(size = 10),
+      axis.text.x = element_text(size = 10, angle = 45, hjust = 1),
+      plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), "cm")
+    )
+  
+  print(dot_plot)
+  pdf_filename <- file.path(output_dir, paste0(filename_prefix, "_dot_plot.pdf"))
+  ggsave(filename = pdf_filename, plot = dot_plot, width = 10, height = 8)
+}
+
+# Function to generate bar plot
+generate_bar_plot <- function(result, title, output_dir, filename_prefix, max_ontologies = params$max_ontologies) {
+  tryCatch({
+    bar_plot <- barplot(result, showCategory = max_ontologies) +
+      ggtitle(title) +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 10),
+        axis.text.x = element_text(size = 10, angle = 45, hjust = 1),
+        plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), "cm")
+      )
+    
+    print(bar_plot)
+    pdf_filename <- file.path(output_dir, paste0(filename_prefix, "_bar_plot.pdf"))
+    ggsave(filename = pdf_filename, plot = bar_plot, width = 10, height = 8)
+  }, error = function(e) {
+    message("Error generating bar plot for ", title, " - ", e$message)
+  })
+}
+
+# Function to generate theme plot (emapplot)
+generate_theme_plot <- function(result, title, output_dir, filename_prefix, max_ontologies = params$max_ontologies) {
+  tryCatch({
+    # Calculate term similarity if not already done
+    result <- pairwise_termsim(result)
+
+    theme_plot <- emapplot(result, showCategory = max_ontologies, layout = "kk") +
+      ggtitle(title) +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(size = 14, face = "bold")
+      )
+
+    print(theme_plot)
+    pdf_filename <- file.path(output_dir, paste0(filename_prefix, "_emap_plot.pdf"))
+    ggsave(filename = pdf_filename, plot = theme_plot, width = 10, height = 8)
+  }, error = function(e) {
+    message("Error generating theme plot for ", title, " - ", e$message)
+  })
+}
+
+
+```
+
+
+###################################
+# Over Enrichment Analyses (ORA)  #
+###################################
+
+
+#Functions: ClusterProfiler GO
+```{r setup and perform clusterProfiler GO for all pairwise comparisons, include = FALSE, eval= TRUE}
+
+
+##################################
+# Perform GO Analysis Function   #
+##################################
+
+perform_GO_analysis <- function(df, dataset_name) {
+  rds_file <- file.path(clusterProfiler_output_dir, paste0(dataset_name, "_GO_results.rds"))
+
+  # Use saved RDS if available
+  if (params$use_saved_rds && file.exists(rds_file)) {
+    message(paste("Loading previously saved GO results for dataset:", dataset_name))
+    go_results <- readRDS(rds_file)
+
+    for (ont in names(go_results)) {
+      title <- paste0("GO Enrichment - ", dataset_name, " (", ont, ")")
+      generate_dot_plot(go_results[[ont]], title, clusterProfiler_output_dir, paste0(dataset_name, "_GO_", ont))
+      generate_bar_plot(go_results[[ont]], title, clusterProfiler_output_dir, paste0(dataset_name, "_GO_", ont))
+    }
+
+    return(go_results)
+  }
+
+  # Perform GO analysis if no saved results are found
+  gene_list <- unique(na.omit(df$entrezgene_id))
+  if (length(gene_list) == 0) {
+    stop(paste("Error: No valid ENTREZ gene IDs for GO enrichment in dataset:", dataset_name))
+  }
+
+  OrgDb <- if (params$species == "Homo sapiens") org.Hs.eg.db else org.Mm.eg.db
+  ontologies <- c("BP", "CC", "MF")
+  go_results <- list()
+
+  for (ont in ontologies) {
+    message(paste("Performing GO enrichment for dataset:", dataset_name, "ontology:", ont))
+    result <- enrichGO(
+      gene = gene_list,
+      OrgDb = OrgDb,
+      keyType = "ENTREZID",
+      ont = ont,
+      pAdjustMethod = "BH",
+      pvalueCutoff = params$pvalue_threshold,
+      qvalueCutoff = params$qvalue_threshold
+    )
+
+    simplified_result <- clusterProfiler::simplify(result, cutoff = 0.7, by = "p.adjust", select_fun = min)
+    go_results[[ont]] <- simplified_result
+
+    # Save CSV and generate plots
+    simplified_result_df <- as.data.frame(simplified_result)
+    write.csv(simplified_result_df, file.path(clusterProfiler_output_dir, paste0(dataset_name, "_GO_", ont, "_simplified_enrichment.csv")))
+
+    title <- paste0("GO Enrichment - ", dataset_name, " (", ont, ")")
+    generate_dot_plot(simplified_result, title, clusterProfiler_output_dir, paste0(dataset_name, "_GO_", ont))
+    generate_bar_plot(simplified_result, title, clusterProfiler_output_dir, paste0(dataset_name, "_GO_", ont))
+  }
+
+  saveRDS(go_results, rds_file)
+  return(go_results)
+}
+
+##############################
+# Compare Cluster Function   #
+##############################
+
+compare_cluster_analysis <- function(data_list) {
+  OrgDb <- if (params$species == "Homo sapiens") org.Hs.eg.db else org.Mm.eg.db
+  ontologies <- c("BP", "MF", "CC")
+  compare_results <- list()
+
+  for (ont in ontologies) {
+    message(paste("Running compareCluster for ontology:", ont))
+
+    gene_clusters <- lapply(data_list, function(df) {
+      unique(na.omit(df$entrezgene_id[df$padj < params$pvalue_threshold]))
+    })
+
+    result <- tryCatch({
+      compareCluster(
+        geneCluster = gene_clusters,
+        fun = "enrichGO",
+        OrgDb = OrgDb,
+        keyType = "ENTREZID",
+        ont = ont,
+        pAdjustMethod = "BH",
+        pvalueCutoff = params$pvalue_threshold
+      )
+    }, error = function(e) {
+      message("Error in compareCluster for ontology:", ont, "-", e$message)
+      return(NULL)
+    })
+
+    if (is.null(result)) next
+
+    compare_results[[ont]] <- result
+
+    # Save results and generate plots
+    compare_result_df <- as.data.frame(result)
+    write.csv(compare_result_df, file.path(clusterProfiler_output_dir, paste0("CompareCluster_", ont, "_GO_enrichment.csv")))
+
+    generate_dot_plot(result, paste0("GO Enrichment Comparison - ", ont), clusterProfiler_output_dir, paste0("CompareCluster_", ont, "_GO"))
+   
+    generate_theme_plot(result, paste0("GO Enrichment Map - ", ont), clusterProfiler_output_dir, paste0("CompareCluster_", ont, "_GO"))
+  }
+
+  message("Saved compareCluster results and plots.")
+  return(compare_results)
+}
+
+```
+
+#Functions: KEGG
+```{r clusterProfiler KEGG}
+###################################
+# Perform KEGG Analysis Function  #
+###################################
+
+perform_KEGG_analysis <- function(df, dataset_name) {
+  rds_file <- file.path(clusterProfiler_output_dir, paste0(dataset_name, "_KEGG_results.rds"))
+
+  # Use saved RDS if available
+  if (params$use_saved_rds && file.exists(rds_file)) {
+    message(paste("Loading previously saved KEGG results for dataset:", dataset_name))
+    kegg_results <- readRDS(rds_file)
+
+    title <- paste0("KEGG Enrichment - ", dataset_name)
+    generate_dot_plot(kegg_results, title, clusterProfiler_output_dir, paste0(dataset_name, "_KEGG"))
+    generate_bar_plot(kegg_results, title, clusterProfiler_output_dir, paste0(dataset_name, "_KEGG"))
+
+    return(kegg_results)
+  }
+
+  # Perform KEGG analysis if no saved results are found
+  gene_list <- unique(na.omit(df$entrezgene_id))
+  if (length(gene_list) == 0) {
+    stop(paste("Error: No valid ENTREZ gene IDs for KEGG enrichment in dataset:", dataset_name))
+  }
+
+  result <- tryCatch({
+    enrichKEGG(
+      gene = gene_list,
+      organism = ifelse(params$species == "Homo sapiens", "hsa", "mmu"),
+      keyType = "ncbi-geneid",
+      universe = unique(na.omit(unlist(lapply(data_list, function(d) d$entrezgene_id)))),
+      pAdjustMethod = "BH",
+      pvalueCutoff = params$pvalue_threshold,
+      qvalueCutoff = params$qvalue_threshold
+    )
+  }, error = function(e) {
+    message("Error during KEGG enrichment for dataset:", dataset_name, "-", e$message)
+    return(NULL)
+  })
+
+  if (is.null(result) || nrow(as.data.frame(result)) == 0) {
+    message("No significant KEGG pathways found for dataset:", dataset_name)
+    return(NULL)
+  }
+
+  saveRDS(result, rds_file)
+
+  # Save results and generate plots
+  result_df <- as.data.frame(result)
+  write.csv(result_df, file.path(clusterProfiler_output_dir, paste0(dataset_name, "_KEGG_enrichment.csv")))
+
+  title <- paste0("KEGG Enrichment - ", dataset_name)
+  generate_dot_plot(result, title, clusterProfiler_output_dir, paste0(dataset_name, "_KEGG"))
+  generate_bar_plot(result, title, clusterProfiler_output_dir, paste0(dataset_name, "_KEGG"))
+
+  return(result)
+}
+
+##################################
+# Compare KEGG Cluster Function  #
+##################################
+
+compare_cluster_kegg_analysis <- function(data_list) {
+  message("Running KEGG compareCluster analysis...")
+
+  gene_clusters <- lapply(data_list, function(df) {
+    unique(na.omit(df$entrezgene_id[df$padj < params$pvalue_threshold]))
+  })
+
+  result <- tryCatch({
+    compareCluster(
+      geneCluster = gene_clusters,
+      fun = "enrichKEGG",
+      organism = ifelse(params$species == "Homo sapiens", "hsa", "mmu"),
+      keyType = "ncbi-geneid",
+      pAdjustMethod = "BH",
+      pvalueCutoff = params$pvalue_threshold
+    )
+  }, error = function(e) {
+    message("Error in KEGG compareCluster analysis - ", e$message)
+    return(NULL)
+  })
+
+  if (is.null(result)) {
+    message("KEGG compareCluster returned no results.")
+    return(NULL)
+  }
+
+  # Save results and generate plots
+  compare_result_df <- as.data.frame(result)
+  write.csv(compare_result_df, file.path(clusterProfiler_output_dir, "CompareCluster_KEGG_enrichment.csv"))
+
+  generate_dot_plot(result, "KEGG Enrichment Comparison", clusterProfiler_output_dir, "CompareCluster_KEGG")
+  generate_bar_plot(result, "KEGG Enrichment Comparison", clusterProfiler_output_dir, "CompareCluster_KEGG")
+  generate_theme_plot(result, "KEGG Enrichment Map", clusterProfiler_output_dir, "CompareCluster_KEGG")
+
+  message("Saved KEGG compareCluster results and plots.")
+  return(result)
+}
+
+```
+
+
+#Execute ClusterProfiler Go
+
+```{r clusterprofiler GO}
+#######################
+# Execute GO analyses for each dataset
+for (df_name in names(data_list)) {
+  message("Running analyses for dataset:", df_name)
+
+  df <- data_list[[df_name]]
+
+  # Run analyses, allowing the parameter`use_saved_rds` to control reloading
+  go_results <- perform_GO_analysis(df, dataset_name = df_name)
+  }
+# Run compareCluster analysis across all datasets
+compare_cluster_results <- compare_cluster_analysis(data_list)
+```
+#Execute ClusterProfiler KEGG
+```{r ClusterProfiler KEGG, include = FALSE, eval = FALSE}
+#########################################
+# Execute KEGG analyses for each dataset #
+#########################################
+
+for (df_name in names(data_list)) {
+  message("Running KEGG analysis for dataset:", df_name)
+  
+  df <- data_list[[df_name]]
+  
+  # Run KEGG analysis, allowing use of saved results if specified
+  kegg_results <- perform_KEGG_analysis(df, dataset_name = df_name)
+}
+
+# Run KEGG compareCluster analysis across all datasets
+compare_cluster_kegg_results <- compare_cluster_kegg_analysis(data_list)
+
+
+```
+
+
+#######################################
+# Gene Set Enrichment Analyses (ORA)  #
+#######################################
+
+
+**Gene Set Enrichment Analysis**
+*This is distinct from ClusterProfiler, which is an overenrichment analysis (ORA)*
+*GSEA is a rank analysis*
+
+#GSEA Load Gene Sets
+
+
+```{r Load Gene Sets, echo = FALSE}
+
+# Function to dynamically load gene sets for GSEA
+load_gene_sets <- function(
+  species = "Homo sapiens", 
+  msig_category = NULL, 
+  msig_subcategory = NULL, 
+  search_pattern = NULL
+) {
+  if (is.vector(msig_subcategory)) {
+    gene_sets <- purrr::map_dfr(msig_subcategory, function(subcat) {
+      msigdbr(species = species, category = msig_category, subcategory = subcat)
+    })
+  } else {
+    gene_sets <- msigdbr(species = species, category = msig_category, subcategory = msig_subcategory)
+  }
+  
+  # Filter by search pattern if provided
+  if (!is.null(search_pattern)) {
+    gene_sets <- gene_sets %>%
+      dplyr::filter(grepl(search_pattern, gs_name, ignore.case = TRUE))
+  }
+  
+  # Select relevant columns
+  gene_sets <- gene_sets %>%
+    dplyr::select(gs_name, entrez_gene)
+  
+  if (nrow(gene_sets) == 0) {
+    stop("No matching gene sets found. Check your input parameters.")
+  }
+  
+  message(paste("Loaded", nrow(gene_sets), "gene sets from MSigDB."))
+  return(gene_sets)
+}
+
+```
+
+
+Here’s what each term in perform_gsea controls:
+
+*Parameter	Description*
+pvalue_cutoff	The p-value threshold for pathway significance.
+min_gs_size	Minimum gene set size to consider for enrichment.
+max_gs_size	Maximum gene set size to consider for enrichment.
+eps	A small epsilon value to control precision in fgsea.
+top_n_pathways	Number of top pathways to display in plots.
+showCategory	Number of top categories to show in dotplots and ridgeplots.
+
+#GSEA Function Definitions
+```{r GSEA Functions,include = FALSE, echo = FALSE}
+
+
+plot_rank_distribution <- function(ranked_genes, dataset_name, output_dir) {
+  if (length(ranked_genes) == 0) {
+    message("Skipping plot: No ranked genes available for dataset: ", dataset_name)
+    return(NULL)
+  }
+
+  ranked_df <- data.frame(
+    RankValue = ranked_genes,
+    Sign = ifelse(ranked_genes > 0, "Upregulated", "Downregulated")
+  )
+
+  rank_dist_plot <- ggplot(ranked_df, aes(x = RankValue, fill = Sign)) +
+    geom_histogram(bins = 100, alpha = 0.7, position = "identity") +
+    scale_fill_manual(values = c("Upregulated" = params$upreg_color, "Downregulated" = params$downreg_color)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+    labs(title = paste("Ranking Distribution:", dataset_name),
+         x = "Ranking Metric (e.g., Wald stat, log2FC * -log10(padj))",
+         y = "Gene Count",
+         fill = "Direction") +
+    theme_minimal()
+
+  pdf(file.path(output_dir, paste0(dataset_name, "_Ranking_Distribution.pdf")), width = 8, height = 6)
+  print(rank_dist_plot)
+  dev.off()
+
+  print(rank_dist_plot)
+}
+
+
+
+
+##############################################
+# Convert and rank genes        ##############
+##############################################
+
+# Function to convert and rank genes for GSEA
+convert_and_rank_genes <- function(data, species = "Homo sapiens", rank_by = "log2FoldChange", baseMean_threshold = 10) {
+  
+  # Filter out weakly expressed genes
+  if ("baseMean" %in% colnames(data)) {
+    message(paste("Filtering out genes with baseMean <", baseMean_threshold))
+    data <- data %>% filter(baseMean >= baseMean_threshold)
+  } else {
+    message("baseMean column not found; skipping expression filtering.")
+  }
+
+  # Determine ranking metric: Prefer Wald statistic, else approximate it
+  if ("stat" %in% colnames(data) && rank_by == "stat") {
+    message("Using Wald statistic for ranking.")
+    data$RankValue <- data$stat
+  } else if ("log2FoldChange" %in% colnames(data) && "lfcSE" %in% colnames(data) && rank_by == "Wald") {
+    message("Wald statistic missing. Computing log2FoldChange / lfcSE.")
+    data$RankValue <- data$log2FoldChange / data$lfcSE
+  } else if (rank_by %in% colnames(data)) {
+    message(paste("Using", rank_by, "for ranking."))
+    data$RankValue <- data[[rank_by]]
+  } else {
+    stop("Neither Wald stat nor specified rank metric available. Cannot rank genes for GSEA.")
+  }
+
+  # Remove NA values
+  data <- data %>% filter(!is.na(RankValue), !is.na(entrezgene_id))
+  
+  # Add small noise to handle ties
+  data$RankValue <- data$RankValue + rnorm(nrow(data), mean = 0, sd = 1e-5)
+  
+  # Create ranked gene list
+  ranked_genes <- data$RankValue
+  names(ranked_genes) <- as.character(data$entrezgene_id)
+  
+  # Remove duplicates and sort
+  ranked_genes <- ranked_genes[!duplicated(names(ranked_genes))]
+  ranked_genes <- sort(ranked_genes, decreasing = TRUE)
+  
+  return(ranked_genes)
+}
+
+##############################################
+# GSEA analysis                 ##############
+##############################################
+
+# Function to perform GSEA
+perform_gsea <- function(
+  data, 
+  gene_sets, 
+   msig_category = NULL, 
+  msig_subcategory = NULL,
+  dataset_name = "Dataset",
+  species = "Homo sapiens",
+  pvalue_cutoff = 0.05, 
+  min_gs_size = 15, 
+  max_gs_size = 500, 
+  eps = 1e-10, 
+  top_n_pathways = 5, 
+  showCategory = 10
+) {
+  message(paste("Ranking genes for dataset:", dataset_name))
+  
+  ranked_genes <- tryCatch({
+    convert_and_rank_genes(data, species = species)
+  }, error = function(e) {
+    stop(paste("ERROR in convert_and_rank_genes for dataset:", dataset_name, "-", e$message))
+  })
+  
+  if (length(ranked_genes) == 0) {
+    stop(paste("ERROR: No valid ranked genes for dataset:", dataset_name))
+  }
+  
+  print(head(ranked_genes))  # Debugging
+
+  message(paste("Running GSEA for dataset:", dataset_name))
+
+  gsea_results <- tryCatch({
+    GSEA(
+      ranked_genes, 
+      TERM2GENE = gene_sets, 
+      pvalueCutoff = pvalue_cutoff,
+      minGSSize = min_gs_size, 
+      maxGSSize = max_gs_size,
+      eps = eps
+    )
+  }, error = function(e) {
+    stop(paste("ERROR in GSEA for dataset:", dataset_name, "-", e$message))
+  })
+  
+  # **NEW DEBUGGING LOGS**
+  if (is.null(gsea_results) || is.null(gsea_results@result) || nrow(gsea_results@result) == 0) {
+    stop(paste("ERROR: GSEA returned no significant pathways for dataset:", dataset_name))
+  }
+
+  print(paste("Number of enriched pathways:", nrow(gsea_results@result)))
+  print("First few rows of GSEA results:")
+  print(head(gsea_results@result))
+
+  message(paste("Saving results for dataset:", dataset_name))
+ 
+  
+  # Prepare subcategory label for filenames
+  subcat_label <- if (!is.null(msig_subcategory) && msig_subcategory != "") {
+    paste0("_", msig_subcategory)
+  } else {
+    ""
+  }
+
+  # Export NES table
+  nes_table <- as.data.frame(gsea_results@result)
+  write.csv(nes_table, file.path(
+    GSEA_output_dir, 
+    paste0(dataset_name, "_", msig_category, subcat_label, "_GSEA_NES_Table.csv")
+  ), row.names = FALSE)
+
+  return(gsea_results)
+}
+
+
+####################################
+# RUN GSEA FOR DATASETS          ###
+####################################
+
+# Function to run GSEA for all datasets
+run_gsea_for_datasets <- function(
+  data_list, 
+  species = "Homo sapiens", 
+  msig_category = NULL, 
+  msig_subcategory = NULL, 
+  pvalue_cutoff = 0.05, 
+  min_gs_size = 15, 
+  max_gs_size = 500, 
+  eps = 1e-10, 
+  top_n_pathways = 5, 
+  showCategory = 10, 
+  output_dir = GSEA_output_dir
+  
+  ) {
+
+
+  # Load gene sets dynamically
+  gene_sets <- load_gene_sets(
+    species = species, 
+    msig_category = msig_category, 
+    msig_subcategory = msig_subcategory
+  )
+
+  # Initialize list to store GSEA results
+  gsea_results_list <- list()
+
+  for (i in seq_along(data_list)) {
+    dataset_name <- names(data_list)[i]
+    dataset <- data_list[[i]]
+
+    message(paste("Processing dataset:", dataset_name))
+    
+    tryCatch({
+      gsea_results <- perform_gsea(
+        data = dataset,
+        gene_sets = gene_sets,
+        dataset_name = dataset_name,
+        msig_category = msig_category,
+        msig_subcategory = msig_subcategory,
+        species = species,
+        pvalue_cutoff = pvalue_cutoff,
+        min_gs_size = min_gs_size,
+        max_gs_size = max_gs_size,
+        eps = eps,
+        top_n_pathways = top_n_pathways,
+        showCategory = showCategory
+      )
+
+      # Store results in the list
+      if (!is.null(gsea_results)) {
+        gsea_results_list[[dataset_name]] <- gsea_results
+      }
+
+    }, error = function(e) {
+      message(paste("Error processing dataset:", dataset_name, "-", e$message))
+    })
+  }
+
+  # Save the list of results as an .RDS file for later use
+  saveRDS(gsea_results_list, file = file.path(paste0(GSEA_output_dir, "_", dataset_name, "_", "GSEA_Results.rds")))
+
+# return the list
+
+return(gsea_results_list)
+
+}
+
+
+##############################################
+# Plot individual GSEA outputs  ##############
+##############################################
+
+# Plot function to visualize stored results
+plot_gsea_results <- function(
+  gsea_results_list, 
+  top_n_pathways = 5, 
+  showCategory = 10, 
+  analysis_name = NULL,
+  output_dir = GSEA_output_dir
+) {
+  # Ensure output directory exists
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+  }
+
+  # Loop through all datasets in the results list
+  for (dataset_name in names(gsea_results_list)) {
+    message(paste("Generating plots for dataset:", dataset_name))
+
+    gsea_results <- gsea_results_list[[dataset_name]]
+
+    # Check if results exist and have enriched pathways
+    if (is.null(gsea_results) || nrow(gsea_results@result) == 0) {
+      message(paste("No significant pathways for dataset:", dataset_name))
+      next
+    }
+
+    # Plot ridgeplot
+    ridge_summary <- ridgeplot(gsea_results, showCategory = min(showCategory, nrow(gsea_results@result))) +
+      ggtitle(paste(dataset_name, "- GSEA Ridgeplot"))
+
+    # Save and display the ridgeplot
+    pdf(file.path(GSEA_output_dir, paste0(dataset_name, "_", analysis_name, "_GSEA_Ridgeplot.pdf")), height = 8, width = 10)
+    print(ridge_summary)
+    dev.off()
+    print(ridge_summary)
+
+    # Plot dotplot
+    dot_summary <- dotplot(gsea_results, showCategory = min(showCategory, nrow(gsea_results@result))) +
+      ggtitle(paste(dataset_name, "- GSEA Dotplot"))
+
+    # Save and display the dotplot
+    pdf(file.path(GSEA_output_dir, paste0(dataset_name, "_", analysis_name, "_GSEA_Dotplot.pdf")), height = 8, width = 10)
+    print(dot_summary)
+    dev.off()
+    print(dot_summary)
+
+    # Plot running enrichment plots for top pathways
+    top_pathways <- as.character(gsea_results@result$ID[1:min(top_n_pathways, nrow(gsea_results@result))])
+    if (length(top_pathways) == 0) {
+      message(paste("No enriched pathways for running plots in dataset:", dataset_name))
+      next
+    }
+
+    for (pathway in top_pathways) {
+      tryCatch({
+        running_plot <- gseaplot2(gsea_results, geneSetID = pathway) +
+          ggtitle(paste(dataset_name, "- Enrichment Plot:", pathway))
+
+        # Save and display the running enrichment plot
+        pdf(file.path(GSEA_output_dir, paste0(dataset_name, "_GSEA_RunningPlot_",  analysis_name, pathway, ".pdf")), height = 8, width = 10)
+        print(running_plot)
+        dev.off()
+        print(running_plot)
+      }, error = function(e) {
+        message(paste("Error plotting pathway:", pathway, "-", e$message))
+      })
+    }
+  }
+
+  message("All plots generated and saved.")
+}
+
+#######################################################
+# Function to check if GSEA results list is empty
+check_empty_gsea_results <- function(gsea_results_list) {
+  # Check if the list is empty or has no significant results
+  valid_results <- lapply(gsea_results_list, function(result) {
+    if (!is.null(result) && nrow(result@result) > 0) TRUE else FALSE
+  })
+  if (!any(unlist(valid_results))) {
+    message("No enriched pathways found in any dataset. Exiting plotting.")
+    return(TRUE)
+  }
+  return(FALSE)
+}
+
+
+##############################################
+# GSEA NES HEATMAP              ##############
+##############################################
+
+############################################################
+
+# Function to plot GSEA NES heatmap and per-dataset dotplot
+plot_gsea_analysis <- function(
+  gsea_results_list, 
+  pval_cutoff = 0.05, 
+  top_n_pathways = 30,  
+  output_dir = GSEA_output_dir, 
+  analysis_name = "GSEA"
+) {
+  library(dplyr)
+  library(tidyr)
+  library(ComplexHeatmap)
+  library(ggplot2)
+  library(circlize)
+
+  # Extract and filter NES data from GSEA results
+  nes_data <- lapply(names(gsea_results_list), function(dataset_name) {
+    gsea_results <- gsea_results_list[[dataset_name]]
+    
+    if (!is.null(gsea_results) && "result" %in% slotNames(gsea_results) && nrow(gsea_results@result) > 0) {
+      gsea_results@result %>%
+        dplyr::filter(pvalue < pval_cutoff) %>%
+        dplyr::select(ID, NES, pvalue, qvalue) %>%
+        dplyr::mutate(Dataset = dataset_name)
+    } else {
+      NULL
+    }
+  }) %>% bind_rows()
+
+  if (nrow(nes_data) == 0) {
+    message("No significant pathways found. Skipping heatmap and dotplot.")
+    return(NULL)
+  }
+
+  # Save the NES table
+  write.csv(nes_data, file = file.path(output_dir, paste0(analysis_name, "_NES_Data.csv")), row.names = FALSE)
+
+  # Convert NES data to a matrix for heatmap
+  nes_matrix <- nes_data %>%
+    group_by(ID, Dataset) %>%
+    summarize(NES = mean(NES, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = Dataset, values_from = NES, values_fill = 0)
+
+  rownames(nes_matrix) <- nes_matrix$ID
+  nes_matrix <- nes_matrix[, -1]  # Remove pathway column before conversion
+  nes_matrix <- as.matrix(nes_matrix)
+  storage.mode(nes_matrix) <- "numeric"
+
+  heatmap_colors <- colorRampPalette(c("#5e3c99", "white", "#e66101"))(100)
+
+  # Conditional row name display
+  show_names <- ifelse(nrow(nes_matrix) <= 30, TRUE, FALSE)
+
+  pdf(file.path(output_dir, paste0(analysis_name, "_NES_Heatmap.pdf")), width = 10, height = 10)
+  heatmap_plot <- Heatmap(
+    nes_matrix,
+    name = "NES",
+    col = heatmap_colors,
+    cluster_rows = TRUE,
+    cluster_columns = TRUE,
+    show_row_names = show_names,
+    show_column_names = TRUE,
+    heatmap_legend_param = list(title = "NES")
+  )
+  draw(heatmap_plot)
+  dev.off()
+
+  print(heatmap_plot) # Ensure it appears in RMarkdown
+
+  ####### Dotplot ########
+
+  # Adjust dotplot to show NES as color and q-value as size
+  nes_data$log_qval <- -log10(nes_data$qvalue)
+
+  dotplot <- ggplot(nes_data, aes(x = Dataset, y = ID, size = log_qval, color = NES)) +
+    geom_point() +
+    scale_size_continuous(range = c(3, 10)) +
+    scale_color_gradient2(low = params$downreg_color, mid = "white", high = params$upreg_color, midpoint = 0) +  # NES color mapping
+    theme_minimal() +
+    theme(axis.text.x = element_text(hjust = 1)) +
+    labs(
+      title = paste(analysis_name, "Per-Dataset Dotplot"),
+      x = "Dataset",
+      y = "Pathway",
+      size = "-log10(Pathway q-value)",
+      color = "NES"
+    )
+
+  pdf(file.path(output_dir, paste0(analysis_name, "_PerDataset_Dotplot.pdf")), width = 8, height = 11)
+  print(dotplot)
+  dev.off()
+
+  print(dotplot) # Ensure it appears in RMarkdown
+}
+
+
+```
+
+#GSEA C2 KEGG
+```{r GSEA KEGG, include=TRUE}
+
+C2_KEGG_GSEA_list <- run_gsea_for_datasets(
+  data_list = data_list, 
+  species = params$species, 
+  msig_category = "C2", 
+  msig_subcategory = "CP:KEGG",  
+  pvalue_cutoff = 0.05,  
+  showCategory = 12,  # Show 12 pathways in dotplots
+  output_dir = GSEA_output_dir
+)
+
+plot_gsea_results(
+  gsea_results_list = C2_KEGG_GSEA_list,
+  showCategory = 10,
+  analysis_name = "KEGG_GSEA_",
+  output_dir = GSEA_output_dir
+)
+
+# plot heatmap of significant NES scores
+ plot_gsea_analysis(
+     gsea_results_list = C2_KEGG_GSEA_list,
+     output_dir = GSEA_output_dir,
+     pval_cutoff = 0.05,
+     top_n_pathways = 30,  
+     analysis_name = "KEGG_GSEA_"
+)
+
+
+```
+
+#GSEA C2 CGP
+```{r GSEA C2 CGP, include=TRUE}
+
+C2CGP_GSEA_list <- run_gsea_for_datasets(
+  data_list = data_list,
+  species =  params$species, 
+  msig_category = "C2", 
+  msig_subcategory = c("CGP"),
+  pvalue_cutoff = 0.05,  
+    output_dir = GSEA_output_dir
+)
+
+plot_gsea_results(
+  gsea_results_list = C2CGP_GSEA_list,
+  top_n_pathways = 5,
+  showCategory = 10,
+   analysis_name = "C2CGP_GSEA_",
+  output_dir = GSEA_output_dir
+)
+
+ plot_gsea_analysis(
+     gsea_results_list = C2CGP_GSEA_list,
+     output_dir = GSEA_output_dir,
+     pval_cutoff = 0.05,
+     top_n_pathways = 30,  
+     analysis_name = "C2_CGP_GSEA"
+)
+
+
+```
+
+1#GSEA C2 CP
+```{r GSEA C2 CP, include=TRUE}
+
+C2CP_GSEA_list <- run_gsea_for_datasets(
+  data_list = data_list,
+  species =  params$species, 
+  msig_category = "C2", 
+  msig_subcategory = c("CP"),
+  pvalue_cutoff = 0.05,  
+    output_dir = GSEA_output_dir
+)
+
+plot_gsea_results(
+  gsea_results_list = C2CP_GSEA_list,
+  top_n_pathways = 5,
+  showCategory = 10,
+   analysis_name = "C2-CP_GSEA_",
+  output_dir = GSEA_output_dir
+)
+
+plot_gsea_analysis(
+     gsea_results_list = C2CP_GSEA_list,
+     output_dir = GSEA_output_dir,
+     pval_cutoff = 0.05,
+     top_n_pathways = 30,  
+     analysis_name = "C2-CP_GSEA_"
+)
+
+
+```
+
+#GSEA: C2 Reactome
+```{r GSEA Reactome, include=TRUE}
+
+
+C2_Reactome_GSEA_list <- run_gsea_for_datasets(
+  data_list = data_list,
+  species = params$species, 
+  msig_category = "C2", 
+  msig_subcategory = c("REACTOME"), 
+  pvalue_cutoff = 0.05,  
+  min_gs_size = 10,  # Adjusted minimum gene set size
+  output_dir = GSEA_output_dir
+)
+
+plot_gsea_results(
+  gsea_results_list = C2_Reactome_GSEA_list,
+  top_n_pathways = 5,
+  showCategory = 10,
+   analysis_name = "C2REACTOME_GSEA_",
+  output_dir = GSEA_output_dir
+)
+
+plot_gsea_analysis(
+     gsea_results_list = C2_Reactome_GSEA_list,
+     output_dir = GSEA_output_dir,
+     pval_cutoff = 0.05,
+     top_n_pathways = 30,  
+     analysis_name = "C2REACTOME_GSEA_"
+)
+
+
+```
+
+
+#GSEA C3 - Regulatory Target Gene Sets
+```{r GSEA C3, include=TRUE}
+
+C3_GSEA_list <- run_gsea_for_datasets(
+  data_list = data_list,
+  species =  params$species, 
+  msig_category = "C3", 
+  pvalue_cutoff = 0.05,  
+  output_dir = GSEA_output_dir
+)
+
+plot_gsea_results(
+  gsea_results_list = C3_GSEA_list,
+  top_n_pathways = 5,
+  showCategory = 10,
+   analysis_name = "C3_GSEA_",
+  output_dir = GSEA_output_dir
+)
+
+plot_gsea_analysis(
+     gsea_results_list = C3_GSEA_list,
+     output_dir = GSEA_output_dir,
+     pval_cutoff = 0.05,
+     top_n_pathways = 30,  
+     analysis_name = "C3_GSEA_"
+)
+
+```
+
+#GSEA C4 - Computational Gene Sets
+```{r GSEA C4, include=TRUE}
+
+C4_GSEA_list <- run_gsea_for_datasets(
+  data_list = data_list,
+  species =  params$species, 
+  msig_category = "C4", 
+  pvalue_cutoff = 0.05,  
+  output_dir = GSEA_output_dir
+)
+
+plot_gsea_results(
+  gsea_results_list = C4_GSEA_list,
+  top_n_pathways = 5,
+  showCategory = 10,
+   analysis_name = "C4_GSEA_",
+  output_dir = GSEA_output_dir
+)
+
+plot_gsea_analysis(
+     gsea_results_list = C4_GSEA_list,
+     output_dir = GSEA_output_dir,
+     pval_cutoff = 0.05,
+     top_n_pathways = 30,  
+     analysis_name = "C4_GSEA_"
+)
+
+```
+
+
+#GSEA C6 Oncogenic Signature
+```{r GSEA C6, include=TRUE}
+
+
+C6_GSEA_list <- run_gsea_for_datasets(
+  data_list = data_list,
+  species = params$species, 
+  msig_category = "C6", 
+  output_dir = GSEA_output_dir
+)
+
+plot_gsea_results(
+  gsea_results_list = C6_GSEA_list,
+  top_n_pathways = 5,
+  showCategory = 10,
+   analysis_name = "C6_GSEA_",
+  output_dir = GSEA_output_dir
+)
+
+
+plot_gsea_analysis(
+     gsea_results_list = C6_GSEA_list,
+     output_dir = GSEA_output_dir,
+     pval_cutoff = 0.05,
+     top_n_pathways = 30,  
+     analysis_name = "C6_GSEA_"
+)
+
+```
+
+
+#GSEA C7 Immunological Signature
+```{r GSEA C7, include=TRUE}
+
+
+C7_GSEA_list <- run_gsea_for_datasets(
+  data_list = data_list,
+  species = params$species, 
+  msig_category = "C7", 
+  output_dir = GSEA_output_dir
+)
+
+plot_gsea_results(
+  gsea_results_list = C7_GSEA_list,
+  top_n_pathways = 5,
+  showCategory = 10,
+   analysis_name = "C7_GSEA_",
+  output_dir = GSEA_output_dir
+)
+
+
+plot_gsea_analysis(
+     gsea_results_list = C7_GSEA_list,
+     output_dir = GSEA_output_dir,
+     pval_cutoff = 0.05,
+     top_n_pathways = 30,  
+     analysis_name = "C7_GSEA_"
+)
+
+```
+
+
