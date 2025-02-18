@@ -142,6 +142,93 @@ GSEA_output_dir <- paste0(params$output_dir, "GSEA/")
 
 ```
 
+#Convert IDs Biomart / Entrez
+```{r convert ids}
+
+convert_and_map_entrez <- function(df, species = "Homo sapiens") {
+  message("Attempting to retrieve Entrez IDs...")
+
+  # Ensure gene_id column exists
+  if (!"gene_id" %in% colnames(df)) {
+    stop("Error: `gene_id` column is missing from input data.")
+  }
+
+  # Try OrgDb first (FAST and OFFLINE)
+  message("Trying OrgDb...")
+  OrgDb <- if (species == "Homo sapiens") org.Hs.eg.db else if (species == "Mus musculus") org.Mm.eg.db else NULL
+
+  if (!is.null(OrgDb)) {
+    mapped_genes <- tryCatch({
+      select(OrgDb, keys = df$gene_id, keytype = "ENSEMBL", columns = "ENTREZID")
+    }, error = function(e) NULL)
+
+    if (!is.null(mapped_genes) && nrow(mapped_genes) > 0) {
+      message(paste("OrgDb: Retrieved", nrow(mapped_genes), "Entrez IDs"))
+      
+      # Merge and correctly assign ENTREZ IDs
+      df <- df %>%
+        dplyr::left_join(mapped_genes, by = c("gene_id" = "ENSEMBL")) %>%
+        dplyr::mutate(entrezgene_id = as.character(ENTREZID)) %>%
+        dplyr::select(-ENTREZID)  # Remove unnecessary columns
+
+      return(df)
+    }
+  }
+
+  # If OrgDb fails, try BioMart (SLOWER, ONLINE)
+  message("OrgDb failed. Trying BioMart...")
+  mart_dataset <- ifelse(species == "Homo sapiens", "hsapiens_gene_ensembl",
+                         ifelse(species == "Mus musculus", "mmusculus_gene_ensembl", NULL))
+
+  if (!is.null(mart_dataset)) {
+    mart <- tryCatch({
+      useMart("ensembl", dataset = mart_dataset, host = "https://www.ensembl.org")
+    }, error = function(e) NULL)
+
+    if (!is.null(mart)) {
+      mapped_genes <- getBM(
+        attributes = c("ensembl_gene_id", "entrezgene_id"),
+        filters = "ensembl_gene_id",
+        values = unique(na.omit(df$gene_id)),
+        mart = mart
+      )
+
+      if (nrow(mapped_genes) > 0) {
+        message(paste("BioMart: Retrieved", nrow(mapped_genes), "Entrez IDs"))
+
+        df <- df %>%
+          dplyr::left_join(mapped_genes, by = c("gene_id" = "ensembl_gene_id")) %>%
+          dplyr::mutate(entrezgene_id = as.character(entrezgene_id)) # Ensure proper assignment
+
+        return(df)
+      }
+    }
+  }
+
+  # If both OrgDb and BioMart fail, try MSigDB (LIMITED COVERAGE)
+  message("BioMart failed. Trying MSigDB...")
+  msigdb_genes <- msigdbr(species = species) %>%
+    dplyr::select(gs_name, entrez_gene)
+
+  df <- df %>%
+    dplyr::left_join(msigdb_genes, by = c("gene_id" = "gs_name")) %>%
+    dplyr::mutate(entrezgene_id = as.character(entrez_gene)) %>%
+    dplyr::select(-entrez_gene) # Remove unnecessary column
+
+  # Ensure ENTREZ IDs were assigned correctly
+  valid_entrez_count <- sum(!is.na(df$entrezgene_id))
+  if (valid_entrez_count > 0) {
+    message(paste("MSigDB: Retrieved", valid_entrez_count, "Entrez IDs"))
+    return(df)
+  }
+
+  # If everything fails
+  stop("Error: No valid Entrez IDs found from OrgDb, BioMart, or MSigDB. Gene conversion failed.")
+}
+
+
+```
+
 *Load and prepare data*
 
 #Load and prepare data
@@ -181,94 +268,19 @@ clean_gene_id <- function(df) {
 
 data_list <- lapply(data_list, clean_gene_id)
 
+# Ensure all datasets have ENTREZ IDs before analysis
+data_list <- lapply(data_list, function(df) {
+  convert_and_map_entrez(df, species = params$species)
+})
+
+
 #outputdir
 output_dir <- params$output_dir 
 
 
 ```
 
-#Convert IDs Biomart / Entrez
-```{r convert ids}
 
-
-convert_and_map_entrez <- function(df, species = "Homo sapiens") {
-  message("Attempting to retrieve Entrez IDs...")
-
-  # Ensure gene_id column exists
-  if (!"gene_id" %in% colnames(df)) {
-    stop("Error: `gene_id` column is missing from input data.")
-  }
-
-  df$entrezgene_id <- NA  # Initialize column to avoid missing joins
-
-  # Try OrgDb first (FAST and OFFLINE)
-  message("Trying OrgDb...")
-  OrgDb <- if (species == "Homo sapiens") org.Hs.eg.db else if (species == "Mus musculus") org.Mm.eg.db else NULL
-
-  if (!is.null(OrgDb)) {
-    mapped_genes <- tryCatch({
-      select(OrgDb, keys = df$gene_id, keytype = "ENSEMBL", columns = "ENTREZID")
-    }, error = function(e) NULL)
-
-    if (!is.null(mapped_genes) && nrow(mapped_genes) > 0) {
-      message(paste("OrgDb: Retrieved", nrow(mapped_genes), "Entrez IDs"))
-      df <- merge(df, mapped_genes, by.x = "gene_id", by.y = "ENSEMBL", all.x = TRUE)
-      return(df)
-    }
-  }
-
-  # If OrgDb fails, try BioMart (SLOWER, ONLINE)
-  message("OrgDb failed. Trying BioMart...")
-  mart_dataset <- ifelse(species == "Homo sapiens", "hsapiens_gene_ensembl",
-                         ifelse(species == "Mus musculus", "mmusculus_gene_ensembl", NULL))
-
-  if (!is.null(mart_dataset)) {
-    mart <- tryCatch({
-      useMart("ensembl", dataset = mart_dataset, host = "https://www.ensembl.org")
-    }, error = function(e) NULL)
-
-    if (!is.null(mart)) {
-      mapped_genes <- getBM(
-        attributes = c("ensembl_gene_id", "entrezgene_id"),
-        filters = "ensembl_gene_id",
-        values = unique(na.omit(df$gene_id)),
-        mart = mart
-      )
-
-      if (nrow(mapped_genes) > 0) {
-        message(paste("BioMart: Retrieved", nrow(mapped_genes), "Entrez IDs"))
-        df <- merge(df, mapped_genes, by.x = "gene_id", by.y = "ensembl_gene_id", all.x = TRUE)
-        return(df)
-      }
-    }
-  }
-
-  # If both OrgDb and BioMart fail, try MSigDB (LIMITED COVERAGE)
-  message("BioMart failed. Trying MSigDB...")
-  msigdb_genes <- msigdbr(species = species) %>%
-    dplyr::select(gs_name, entrez_gene)
-
-  df <- df %>% dplyr::left_join(msigdb_genes, by = c("gene_id" = "gs_name"))
-
-  # Check if MSigDB found any matches
-  valid_entrez_count <- sum(!is.na(df$entrez_gene))
-  if (valid_entrez_count > 0) {
-    message(paste("MSigDB: Retrieved", valid_entrez_count, "Entrez IDs"))
-    df <- df %>% dplyr::rename(entrezgene_id = entrez_gene)
-    return(df)
-  }
-
-  # If everything fails
-  stop("Error: No valid Entrez IDs found from OrgDb, BioMart, or MSigDB. Gene conversion failed.")
-}
-
-
-# Apply ID mapping to all datasets in the list
-data_list <- lapply(data_list, function(df) convert_and_map_entrez(df, species = params$species))
-
-
-
-```
 #Plot functions for clusterProfiler results
 
 ```{r plot functions}
